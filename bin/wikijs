@@ -1,0 +1,2774 @@
+#!/usr/bin/env node
+
+import { program } from 'commander';
+import chalk from 'chalk';
+import ora from 'ora';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
+import { join, dirname, basename } from 'path';
+import { homedir } from 'os';
+
+import inquirer from 'inquirer';
+import {
+  listPages,
+  searchPages,
+  getPage,
+  createPage,
+  updatePage,
+  movePage,
+  deletePage,
+  listTags,
+  listAssets,
+  uploadAsset,
+  deleteAsset,
+  getHealth,
+  getStats,
+  getPageVersions,
+  revertPage
+} from '../lib/api.js';
+import { loadConfig, getConfigPath } from '../lib/config.js';
+import {
+  formatTable,
+  formatJson,
+  truncate,
+  formatDate,
+  formatBytes,
+  success,
+  error,
+  warn,
+  info,
+  parseIdOrPath,
+  parseTags,
+  readStdin
+} from '../lib/utils.js';
+import {
+  setVerbose,
+  setDebug,
+  setNoColor,
+  setRateLimit,
+  debug,
+  verbose,
+  rateLimit,
+  getCached,
+  setCache,
+  createProgress,
+  renderTree,
+  diffStrings,
+  formatDiff,
+  extractLinks,
+  isInternalLink,
+  lintMarkdown,
+  formatLintResults,
+  setOfflineMode,
+  isOfflineMode,
+  getOfflineData,
+  saveOfflineData
+} from '../lib/helpers.js';
+
+// Helper to interpret escape sequences in content
+function interpretEscapes(str) {
+  if (!str) return str;
+  return str
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\r/g, '\r');
+}
+
+// Templates directory
+const TEMPLATES_DIR = join(homedir(), '.config', 'wikijs-templates');
+
+program
+  .name('wikijs')
+  .description('Wiki.js CLI for OpenClaw')
+  .version('1.4.0')
+  .option('-v, --verbose', 'Enable verbose output')
+  .option('-d, --debug', 'Enable debug output')
+  .option('--no-color', 'Disable colored output')
+  .option('--rate-limit <ms>', 'Rate limit between API calls (ms)', '0')
+  .hook('preAction', (thisCommand) => {
+    const opts = thisCommand.opts();
+    if (opts.verbose) setVerbose(true);
+    if (opts.debug) setDebug(true);
+    if (opts.noColor === false) setNoColor(true);
+    if (opts.rateLimit) setRateLimit(parseInt(opts.rateLimit));
+  });
+
+// ============ LIST ============
+program
+  .command('list')
+  .description('List pages')
+  .option('--tag <tag>', 'Filter by tag')
+  .option('--author <author>', 'Filter by author')
+  .option('--locale <locale>', 'Filter by locale')
+  .option('--limit <n>', 'Limit results', '50')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .option('--offline', 'Use cached data (offline mode)')
+  .option('--save-offline', 'Save results for offline use')
+  .action(async (options) => {
+    const spinner = ora('Fetching pages...').start();
+    try {
+      let pages;
+
+      if (options.offline) {
+        // Use offline cache
+        spinner.text = 'Loading from cache...';
+        const offlineData = getOfflineData();
+        if (!offlineData || !offlineData.pages) {
+          spinner.fail('No offline data available');
+          info('Run `wikijs list --save-offline` first to cache data');
+          process.exit(1);
+        }
+        pages = offlineData.pages;
+        spinner.stop();
+        warn(`Using cached data from ${new Date(offlineData.timestamp).toLocaleString()}`);
+      } else {
+        try {
+          pages = await listPages({
+            tag: options.tag,
+            author: options.author,
+            locale: options.locale,
+            limit: parseInt(options.limit)
+          });
+
+          // Save for offline use if requested
+          if (options.saveOffline) {
+            const tags = await listTags();
+            saveOfflineData({ pages, tags });
+            verbose('Data saved for offline use');
+          }
+        } catch (err) {
+          // Try fallback to offline data
+          spinner.text = 'Connection failed, trying offline cache...';
+          const offlineData = getOfflineData();
+          if (offlineData && offlineData.pages) {
+            pages = offlineData.pages;
+            spinner.stop();
+            warn(`Offline mode: using cached data from ${new Date(offlineData.timestamp).toLocaleString()}`);
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      spinner.stop();
+
+      // Apply filters (for offline mode these weren't applied server-side)
+      if (options.offline) {
+        if (options.tag) {
+          pages = pages.filter(p => (p.tags || []).includes(options.tag));
+        }
+        if (options.author) {
+          pages = pages.filter(p => p.authorName === options.author);
+        }
+        if (options.locale) {
+          pages = pages.filter(p => p.locale === options.locale);
+        }
+        pages = pages.slice(0, parseInt(options.limit));
+      }
+
+      if (options.format === 'json') {
+        console.log(formatJson(pages));
+      } else {
+        console.log(formatTable(pages, [
+          { header: 'ID', accessor: p => p.id },
+          { header: 'Path', accessor: p => truncate(p.path, 30) },
+          { header: 'Title', accessor: p => truncate(p.title, 40) },
+          { header: 'Locale', accessor: p => p.locale },
+          { header: 'Updated', accessor: p => formatDate(p.updatedAt) },
+          { header: 'Tags', accessor: p => (p.tags || []).slice(0, 3).join(', ') }
+        ]));
+        info(`${pages.length} page(s) found`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to list pages');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ SEARCH ============
+program
+  .command('search <query>')
+  .description('Search pages')
+  .option('--limit <n>', 'Limit results', '50')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (query, options) => {
+    const spinner = ora(`Searching for "${query}"...`).start();
+    try {
+      const result = await searchPages(query, { limit: parseInt(options.limit) });
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(result));
+      } else {
+        console.log(formatTable(result.results, [
+          { header: 'ID', accessor: p => p.id },
+          { header: 'Path', accessor: p => truncate(p.path, 30) },
+          { header: 'Title', accessor: p => truncate(p.title, 50) },
+          { header: 'Locale', accessor: p => p.locale }
+        ]));
+        info(`${result.totalHits} total hit(s)`);
+        if (result.suggestions && result.suggestions.length > 0) {
+          info(`Suggestions: ${result.suggestions.join(', ')}`);
+        }
+      }
+    } catch (err) {
+      spinner.fail('Search failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ GET ============
+program
+  .command('get <id-or-path>')
+  .description('Get a page')
+  .option('--raw', 'Output raw markdown')
+  .option('--metadata', 'Include metadata')
+  .option('--with-children', 'Include child pages')
+  .option('--locale <locale>', 'Locale for path lookup')
+  .option('--format <format>', 'Output format (json|markdown)', 'markdown')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Fetching page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      const page = await getPage(
+        parsed.type === 'id' ? parsed.value : idOrPath,
+        { withChildren: options.withChildren, locale: options.locale }
+      );
+      spinner.stop();
+
+      if (options.raw || options.format === 'markdown') {
+        if (options.metadata) {
+          console.log(chalk.gray('---'));
+          console.log(chalk.gray(`title: ${page.title}`));
+          console.log(chalk.gray(`path: ${page.path}`));
+          console.log(chalk.gray(`id: ${page.id}`));
+          console.log(chalk.gray(`locale: ${page.locale}`));
+          console.log(chalk.gray(`tags: ${(page.tags || []).join(', ')}`));
+          console.log(chalk.gray(`updated: ${formatDate(page.updatedAt)}`));
+          console.log(chalk.gray('---\n'));
+        }
+        console.log(page.content || '');
+      } else {
+        console.log(formatJson(page));
+      }
+
+      if (options.withChildren && page.children && page.children.length > 0) {
+        console.log(chalk.bold('\nChild pages:'));
+        page.children.forEach(c => console.log(`  - ${c.path} (${c.title})`));
+      }
+    } catch (err) {
+      spinner.fail('Failed to get page');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ CREATE ============
+program
+  .command('create <path> <title>')
+  .description('Create a page')
+  .option('--content <content>', 'Markdown content')
+  .option('--file <file>', 'Read content from file')
+  .option('--stdin', 'Read content from stdin')
+  .option('--template <name>', 'Use a template')
+  .option('--tag <tags>', 'Tags (comma-separated)')
+  .option('--locale <locale>', 'Locale')
+  .option('--publish', 'Publish immediately (default: true)')
+  .option('--draft', 'Create as draft')
+  .option('--lint', 'Lint markdown before creating')
+  .action(async (path, title, options) => {
+    const spinner = ora('Creating page...').start();
+    try {
+      let content = options.content ? interpretEscapes(options.content) : '';
+
+      if (options.template) {
+        // Load template
+        const templatePath = join(TEMPLATES_DIR, `${options.template}.md`);
+        if (!existsSync(templatePath)) {
+          spinner.fail(`Template not found: ${options.template}`);
+          info('Use `wikijs template list` to see available templates');
+          process.exit(1);
+        }
+        content = readFileSync(templatePath, 'utf-8');
+        // Replace placeholders
+        content = content.replace(/\{\{title\}\}/g, title);
+        content = content.replace(/\{\{path\}\}/g, path);
+        content = content.replace(/\{\{date\}\}/g, new Date().toISOString().split('T')[0]);
+        verbose(`Using template: ${options.template}`);
+      } else if (options.file) {
+        content = readFileSync(options.file, 'utf-8');
+      } else if (options.stdin) {
+        spinner.text = 'Reading from stdin...';
+        content = await readStdin();
+      }
+
+      // Lint content if requested
+      if (options.lint) {
+        spinner.text = 'Linting markdown...';
+        const lintResults = lintMarkdown(content);
+        if (!lintResults.valid) {
+          spinner.stop();
+          error('Markdown validation failed:');
+          console.log(formatLintResults(lintResults));
+          process.exit(1);
+        }
+        if (lintResults.warnings.length > 0) {
+          spinner.stop();
+          warn('Markdown warnings:');
+          console.log(formatLintResults(lintResults));
+          spinner.start('Creating page...');
+        }
+      }
+
+      const page = await createPage(path, title, {
+        content,
+        tags: parseTags(options.tag),
+        locale: options.locale,
+        isPublished: !options.draft
+      });
+      spinner.stop();
+
+      success(`Page created: ${page.path} (ID: ${page.id})`);
+      console.log(formatJson(page));
+    } catch (err) {
+      spinner.fail('Failed to create page');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ UPDATE ============
+program
+  .command('update <id-or-path>')
+  .description('Update a page')
+  .option('--content <content>', 'New content')
+  .option('--file <file>', 'Read content from file')
+  .option('--stdin', 'Read content from stdin')
+  .option('--title <title>', 'New title')
+  .option('--description <desc>', 'New description')
+  .option('--tags <tags>', 'Replace tags (comma-separated)')
+  .option('--add-tags <tags>', 'Add tags')
+  .option('--remove-tags <tags>', 'Remove tags')
+  .option('--publish', 'Publish if draft')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Updating page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        // Resolve path to ID
+        spinner.text = 'Resolving path...';
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      let content = options.content ? interpretEscapes(options.content) : undefined;
+      if (options.file) {
+        content = readFileSync(options.file, 'utf-8');
+      } else if (options.stdin) {
+        spinner.text = 'Reading from stdin...';
+        content = await readStdin();
+      }
+
+      // Handle tag operations
+      let tags = options.tags ? parseTags(options.tags) : undefined;
+
+      if (options.addTags || options.removeTags) {
+        spinner.text = 'Fetching current tags...';
+        const currentPage = await getPage(pageId);
+        let currentTags = currentPage.tags || [];
+
+        if (options.addTags) {
+          currentTags = [...new Set([...currentTags, ...parseTags(options.addTags)])];
+        }
+        if (options.removeTags) {
+          const toRemove = parseTags(options.removeTags);
+          currentTags = currentTags.filter(t => !toRemove.includes(t));
+        }
+        tags = currentTags;
+      }
+
+      spinner.text = 'Updating page...';
+      const page = await updatePage(pageId, {
+        content,
+        title: options.title,
+        description: options.description,
+        tags,
+        isPublished: options.publish ? true : undefined
+      });
+      spinner.stop();
+
+      success(`Page updated: ${page.path} (ID: ${page.id})`);
+    } catch (err) {
+      spinner.fail('Failed to update page');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ MOVE ============
+program
+  .command('move <id-or-path> <new-path>')
+  .description('Move a page')
+  .option('--recursive', 'Move with child pages')
+  .action(async (idOrPath, newPath, options) => {
+    const spinner = ora('Moving page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      await movePage(pageId, newPath);
+      spinner.stop();
+
+      success(`Page moved to: ${newPath}`);
+
+      if (options.recursive) {
+        warn('Recursive move: child pages need to be moved manually');
+      }
+    } catch (err) {
+      spinner.fail('Failed to move page');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ DELETE ============
+program
+  .command('delete <id-or-path>')
+  .description('Delete a page')
+  .option('--force', 'Skip confirmation')
+  .option('--permanent', 'Permanent deletion (not trash)')
+  .action(async (idOrPath, options) => {
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+      let pagePath = idOrPath;
+      let pageTitle;
+
+      const spinner = ora('Fetching page info...').start();
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+        const page = await getPage(pageId);
+        pagePath = page.path;
+        pageTitle = page.title;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+        pagePath = page.path;
+        pageTitle = page.title;
+      }
+      spinner.stop();
+
+      if (!options.force) {
+        // Interactive confirmation
+        const { confirm } = await inquirer.prompt([{
+          type: 'confirm',
+          name: 'confirm',
+          message: `Delete "${pageTitle}" (${pagePath}, ID: ${pageId})?`,
+          default: false
+        }]);
+
+        if (!confirm) {
+          info('Deletion cancelled');
+          return;
+        }
+      }
+
+      const deleteSpinner = ora('Deleting page...').start();
+      await deletePage(pageId);
+      deleteSpinner.stop();
+
+      success(`Page deleted: ${pagePath}`);
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ TAGS ============
+program
+  .command('tags')
+  .description('List all tags')
+  .option('--stats', 'Show tag statistics')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Fetching tags...').start();
+    try {
+      const tags = await listTags();
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(tags));
+      } else {
+        console.log(formatTable(tags, [
+          { header: 'ID', accessor: t => t.id },
+          { header: 'Tag', accessor: t => t.tag },
+          { header: 'Title', accessor: t => t.title || t.tag },
+          { header: 'Created', accessor: t => formatDate(t.createdAt) }
+        ]));
+        info(`${tags.length} tag(s) found`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to list tags');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('tag <id-or-path> <action> <tag>')
+  .description('Manage page tags (action: add|remove|set)')
+  .action(async (idOrPath, action, tag, options) => {
+    const spinner = ora('Updating tags...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      const currentPage = await getPage(pageId);
+      let newTags = currentPage.tags || [];
+
+      switch (action) {
+        case 'add':
+          newTags = [...new Set([...newTags, tag])];
+          break;
+        case 'remove':
+          newTags = newTags.filter(t => t !== tag);
+          break;
+        case 'set':
+          newTags = parseTags(tag);
+          break;
+        default:
+          throw new Error(`Unknown action: ${action}. Use: add, remove, or set`);
+      }
+
+      await updatePage(pageId, { tags: newTags });
+      spinner.stop();
+
+      success(`Tags updated: ${newTags.join(', ') || '(none)'}`);
+    } catch (err) {
+      spinner.fail('Failed to update tags');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ EXPORT ============
+program
+  .command('export <destination>')
+  .description('Export pages to files')
+  .option('--format <format>', 'Export format (markdown|json|html)', 'markdown')
+  .option('--with-assets', 'Include assets/images')
+  .option('--flat', 'Flat structure (no subdirectories)')
+  .option('--prefix <prefix>', 'Filename prefix')
+  .option('--limit <n>', 'Limit pages to export', '1000')
+  .action(async (destination, options) => {
+    const spinner = ora('Exporting pages...').start();
+    try {
+      // Ensure destination exists
+      mkdirSync(destination, { recursive: true });
+
+      const pages = await listPages({ limit: parseInt(options.limit) });
+      let exported = 0;
+
+      for (const pageInfo of pages) {
+        spinner.text = `Exporting ${pageInfo.path}...`;
+
+        const page = await getPage(pageInfo.id);
+        let filename;
+        let content;
+
+        if (options.flat) {
+          filename = `${options.prefix || ''}${page.path.replace(/\//g, '_')}`;
+        } else {
+          const dir = join(destination, dirname(page.path));
+          mkdirSync(dir, { recursive: true });
+          filename = join(dirname(page.path), basename(page.path));
+        }
+
+        switch (options.format) {
+          case 'json':
+            content = JSON.stringify(page, null, 2);
+            filename += '.json';
+            break;
+          case 'html':
+            content = page.render || page.content;
+            filename += '.html';
+            break;
+          default: // markdown
+            content = `---\ntitle: ${page.title}\npath: ${page.path}\ntags: [${(page.tags || []).join(', ')}]\n---\n\n${page.content || ''}`;
+            filename += '.md';
+        }
+
+        const filepath = options.flat ? join(destination, filename) : join(destination, filename);
+        writeFileSync(filepath, content);
+        exported++;
+      }
+
+      spinner.stop();
+      success(`Exported ${exported} page(s) to ${destination}`);
+    } catch (err) {
+      spinner.fail('Export failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ BACKUP ============
+program
+  .command('backup')
+  .description('Create a full backup')
+  .option('--full', 'Full backup (default)')
+  .option('--pages-only', 'Pages only')
+  .option('--output <file>', 'Output file', `wikijs-backup-${new Date().toISOString().split('T')[0]}.json`)
+  .action(async (options) => {
+    const spinner = ora('Creating backup...').start();
+    try {
+      const backup = {
+        date: new Date().toISOString(),
+        version: '1.0',
+        pages: [],
+        tags: [],
+        assets: []
+      };
+
+      // Backup pages
+      spinner.text = 'Backing up pages...';
+      const pagesList = await listPages({ limit: 10000 });
+
+      for (const pageInfo of pagesList) {
+        const page = await getPage(pageInfo.id);
+        backup.pages.push(page);
+      }
+
+      if (!options.pagesOnly) {
+        // Backup tags
+        spinner.text = 'Backing up tags...';
+        backup.tags = await listTags();
+
+        // Backup assets list
+        spinner.text = 'Backing up assets list...';
+        backup.assets = await listAssets({ limit: 10000 });
+      }
+
+      writeFileSync(options.output, JSON.stringify(backup, null, 2));
+      spinner.stop();
+
+      success(`Backup created: ${options.output}`);
+      info(`  Pages: ${backup.pages.length}`);
+      info(`  Tags: ${backup.tags.length}`);
+      info(`  Assets: ${backup.assets.length}`);
+    } catch (err) {
+      spinner.fail('Backup failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ IMAGES/ASSETS ============
+program
+  .command('images')
+  .description('List images/assets')
+  .option('--folder <path>', 'Filter by folder')
+  .option('--limit <n>', 'Limit results', '50')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Fetching assets...').start();
+    try {
+      const assets = await listAssets({
+        folder: options.folder,
+        limit: parseInt(options.limit)
+      });
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(assets));
+      } else {
+        console.log(formatTable(assets, [
+          { header: 'ID', accessor: a => a.id },
+          { header: 'Filename', accessor: a => truncate(a.filename, 40) },
+          { header: 'Type', accessor: a => a.ext },
+          { header: 'Size', accessor: a => formatBytes(a.fileSize) },
+          { header: 'Created', accessor: a => formatDate(a.createdAt) }
+        ]));
+        info(`${assets.length} asset(s) found`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to list assets');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('upload <file>')
+  .description('Upload an asset')
+  .option('--folder <path>', 'Target folder')
+  .option('--rename <name>', 'Rename file')
+  .option('--description <desc>', 'Asset description')
+  .action(async (file, options) => {
+    const spinner = ora('Uploading...').start();
+    try {
+      const result = await uploadAsset(file, {
+        folder: options.folder,
+        rename: options.rename
+      });
+      spinner.stop();
+
+      success(`File uploaded: ${options.rename || basename(file)}`);
+      console.log(formatJson(result));
+    } catch (err) {
+      spinner.fail('Upload failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('delete-image <id>')
+  .description('Delete an asset')
+  .option('--force', 'Skip confirmation')
+  .action(async (id, options) => {
+    if (!options.force) {
+      // Interactive confirmation
+      const { confirm } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirm',
+        message: `Delete asset ID ${id}?`,
+        default: false
+      }]);
+
+      if (!confirm) {
+        info('Deletion cancelled');
+        return;
+      }
+    }
+
+    const spinner = ora('Deleting asset...').start();
+    try {
+      await deleteAsset(parseInt(id));
+      spinner.stop();
+      success(`Asset ${id} deleted`);
+    } catch (err) {
+      spinner.fail('Failed to delete asset');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ GREP ============
+program
+  .command('grep <pattern>')
+  .description('Search content across pages')
+  .option('--path <prefix>', 'Limit to path prefix')
+  .option('--context-lines <n>', 'Context lines', '2')
+  .option('--case-sensitive', 'Case sensitive search')
+  .option('--limit <n>', 'Limit results', '100')
+  .action(async (pattern, options) => {
+    const spinner = ora('Searching content...').start();
+    try {
+      const pages = await listPages({ limit: parseInt(options.limit) });
+      const regex = new RegExp(pattern, options.caseSensitive ? 'g' : 'gi');
+      const results = [];
+
+      for (const pageInfo of pages) {
+        if (options.path && !pageInfo.path.startsWith(options.path)) {
+          continue;
+        }
+
+        spinner.text = `Scanning ${pageInfo.path}...`;
+        const page = await getPage(pageInfo.id);
+        const content = page.content || '';
+        const lines = content.split('\n');
+
+        lines.forEach((line, idx) => {
+          if (regex.test(line)) {
+            results.push({
+              page: pageInfo.path,
+              pageId: pageInfo.id,
+              line: idx + 1,
+              content: line.trim(),
+              match: line.match(regex)?.[0]
+            });
+          }
+        });
+      }
+
+      spinner.stop();
+
+      if (results.length === 0) {
+        warn('No matches found');
+        return;
+      }
+
+      console.log(formatTable(results, [
+        { header: 'Page', accessor: r => truncate(r.page, 30) },
+        { header: 'Line', accessor: r => r.line },
+        { header: 'Content', accessor: r => truncate(r.content, 60) }
+      ]));
+      info(`${results.length} match(es) found`);
+    } catch (err) {
+      spinner.fail('Search failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ STATS ============
+program
+  .command('stats')
+  .description('Show wiki statistics')
+  .option('--detailed', 'Show detailed stats')
+  .option('--format <format>', 'Output format (json|text)', 'text')
+  .action(async (options) => {
+    const spinner = ora('Calculating stats...').start();
+    try {
+      const stats = await getStats();
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(stats));
+      } else {
+        console.log(chalk.bold('\nWiki Statistics'));
+        console.log('───────────────────');
+        console.log(`Total pages:     ${stats.totalPages}`);
+        console.log(`Published:       ${stats.publishedPages}`);
+        console.log(`Drafts:          ${stats.draftPages}`);
+
+        console.log(chalk.bold('\nPages by locale:'));
+        Object.entries(stats.locales).forEach(([locale, count]) => {
+          console.log(`  ${locale}: ${count}`);
+        });
+
+        if (options.detailed) {
+          console.log(chalk.bold('\nTop tags:'));
+          const sortedTags = Object.entries(stats.topTags)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10);
+          sortedTags.forEach(([tag, count]) => {
+            console.log(`  ${tag}: ${count}`);
+          });
+        }
+      }
+    } catch (err) {
+      spinner.fail('Failed to get stats');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ HEALTH ============
+program
+  .command('health')
+  .description('Check Wiki.js connection')
+  .action(async () => {
+    const spinner = ora('Checking connection...').start();
+    try {
+      const info = await getHealth();
+      spinner.stop();
+
+      console.log(chalk.green('✓') + ' Wiki.js connected');
+      console.log(`  Version: ${info.currentVersion}`);
+      console.log(`  Platform: ${info.platform} (${info.operatingSystem})`);
+      console.log(`  Hostname: ${info.hostname}`);
+    } catch (err) {
+      spinner.fail('Connection failed');
+      error(err.message);
+      console.log(`\nConfig path: ${getConfigPath()}`);
+      process.exit(1);
+    }
+  });
+
+// ============ INFO ============
+program
+  .command('info <id-or-path>')
+  .description('Show page metadata')
+  .action(async (idOrPath) => {
+    const spinner = ora('Fetching page info...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      const page = await getPage(
+        parsed.type === 'id' ? parsed.value : idOrPath
+      );
+      spinner.stop();
+
+      console.log(chalk.bold('\nPage Information'));
+      console.log('───────────────────');
+      console.log(`ID:          ${page.id}`);
+      console.log(`Path:        ${page.path}`);
+      console.log(`Title:       ${page.title}`);
+      console.log(`Description: ${page.description || '(none)'}`);
+      console.log(`Locale:      ${page.locale}`);
+      console.log(`Author:      ${page.authorName}`);
+      console.log(`Created:     ${formatDate(page.createdAt)}`);
+      console.log(`Updated:     ${formatDate(page.updatedAt)}`);
+      console.log(`Published:   ${page.isPublished ? 'Yes' : 'No'}`);
+      console.log(`Private:     ${page.isPrivate ? 'Yes' : 'No'}`);
+      console.log(`Tags:        ${(page.tags || []).join(', ') || '(none)'}`);
+      console.log(`Content:     ${(page.content || '').length} characters`);
+    } catch (err) {
+      spinner.fail('Failed to get page info');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ VERSIONS ============
+program
+  .command('versions <id-or-path>')
+  .description('Show page version history')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Fetching versions...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      const versions = await getPageVersions(pageId);
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(versions));
+      } else {
+        console.log(formatTable(versions, [
+          { header: 'Version', accessor: v => v.versionId },
+          { header: 'Date', accessor: v => formatDate(v.versionDate) },
+          { header: 'Author', accessor: v => v.authorName },
+          { header: 'Action', accessor: v => v.actionType }
+        ]));
+        info(`${versions.length} version(s)`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to get versions');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ BULK CREATE ============
+program
+  .command('bulk-create <folder>')
+  .description('Create pages from markdown files in a folder')
+  .option('--path-prefix <prefix>', 'Path prefix for pages', '')
+  .option('--tag <tags>', 'Tags to apply (comma-separated)')
+  .option('--dry-run', 'Preview without creating')
+  .action(async (folder, options) => {
+    const spinner = ora('Scanning folder...').start();
+    try {
+      const files = readdirSync(folder).filter(f => f.endsWith('.md'));
+
+      if (files.length === 0) {
+        spinner.fail('No .md files found');
+        return;
+      }
+
+      spinner.stop();
+      info(`Found ${files.length} markdown file(s)`);
+
+      let created = 0;
+      const progress = options.dryRun ? null : createProgress(files.length, 'Creating');
+
+      for (const file of files) {
+        const filepath = join(folder, file);
+        const content = readFileSync(filepath, 'utf-8');
+        const name = file.replace('.md', '');
+        const path = options.pathPrefix ? `${options.pathPrefix}/${name}` : name;
+
+        // Extract title from first heading or use filename
+        const titleMatch = content.match(/^#\s+(.+)$/m);
+        const title = titleMatch ? titleMatch[1] : name;
+
+        if (options.dryRun) {
+          console.log(`  Would create: ${path} - "${title}"`);
+        } else {
+          await rateLimit();
+          debug(`Creating page: ${path}`);
+          await createPage(path, title, {
+            content,
+            tags: parseTags(options.tag)
+          });
+          created++;
+          progress.increment();
+        }
+      }
+
+      if (progress) progress.done();
+      if (options.dryRun) {
+        warn('Dry run - no pages created');
+      } else {
+        success(`Created ${created} page(s)`);
+      }
+    } catch (err) {
+      spinner.fail('Bulk create failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ SYNC ============
+program
+  .command('sync')
+  .description('Sync pages to local directory')
+  .option('--format <format>', 'File format (markdown|json)', 'markdown')
+  .option('--output <path>', 'Output directory')
+  .option('--watch', 'Watch mode - sync periodically')
+  .option('--interval <seconds>', 'Watch interval in seconds', '60')
+  .action(async (options) => {
+    const config = loadConfig();
+    const outputPath = options.output || config.autoSync?.path;
+
+    if (!outputPath) {
+      error('No sync path specified. Use --output or configure autoSync.path');
+      process.exit(1);
+    }
+
+    async function doSync() {
+      const spinner = ora('Syncing pages...').start();
+      try {
+        mkdirSync(outputPath, { recursive: true });
+
+        const pages = await listPages({ limit: 10000 });
+        let synced = 0;
+
+        for (const pageInfo of pages) {
+          spinner.text = `Syncing ${pageInfo.path}...`;
+
+          const page = await getPage(pageInfo.id);
+          const dir = join(outputPath, dirname(page.path));
+          mkdirSync(dir, { recursive: true });
+
+          let content;
+          let ext;
+
+          if (options.format === 'json') {
+            content = JSON.stringify(page, null, 2);
+            ext = '.json';
+          } else {
+            content = page.content || '';
+            ext = '.md';
+          }
+
+          const filepath = join(outputPath, page.path + ext);
+          writeFileSync(filepath, content);
+          synced++;
+        }
+
+        spinner.stop();
+        success(`Synced ${synced} page(s) to ${outputPath}`);
+        return true;
+      } catch (err) {
+        spinner.fail('Sync failed');
+        error(err.message);
+        return false;
+      }
+    }
+
+    // Initial sync
+    const result = await doSync();
+
+    // Watch mode
+    if (options.watch && result) {
+      const intervalMs = parseInt(options.interval) * 1000;
+      info(`Watch mode enabled. Syncing every ${options.interval} seconds. Press Ctrl+C to stop.`);
+
+      setInterval(async () => {
+        await doSync();
+      }, intervalMs);
+    }
+  });
+
+// ============ REVERT ============
+program
+  .command('revert <id-or-path> <version-id>')
+  .description('Revert a page to a specific version')
+  .option('--force', 'Skip confirmation')
+  .action(async (idOrPath, versionId, options) => {
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      const spinner = ora('Fetching page info...').start();
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+      spinner.stop();
+
+      if (!options.force) {
+        const { confirm } = await inquirer.prompt([{
+          type: 'confirm',
+          name: 'confirm',
+          message: `Revert page ${pageId} to version ${versionId}?`,
+          default: false
+        }]);
+
+        if (!confirm) {
+          info('Revert cancelled');
+          return;
+        }
+      }
+
+      const revertSpinner = ora('Reverting page...').start();
+      await revertPage(pageId, parseInt(versionId));
+      revertSpinner.stop();
+
+      success(`Page ${pageId} reverted to version ${versionId}`);
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ BULK UPDATE ============
+program
+  .command('bulk-update <folder>')
+  .description('Update pages from markdown files in a folder')
+  .option('--path-prefix <prefix>', 'Path prefix to match pages', '')
+  .option('--dry-run', 'Preview without updating')
+  .action(async (folder, options) => {
+    const spinner = ora('Scanning folder...').start();
+    try {
+      const files = readdirSync(folder).filter(f => f.endsWith('.md'));
+
+      if (files.length === 0) {
+        spinner.fail('No .md files found');
+        return;
+      }
+
+      spinner.stop();
+      info(`Found ${files.length} markdown file(s)`);
+
+      // Get existing pages
+      spinner.start('Fetching existing pages...');
+      const existingPages = await listPages({ limit: 10000 });
+      spinner.stop();
+
+      let updated = 0;
+      let skipped = 0;
+
+      for (const file of files) {
+        const filepath = join(folder, file);
+        const content = readFileSync(filepath, 'utf-8');
+        const name = file.replace('.md', '');
+        const path = options.pathPrefix ? `${options.pathPrefix}/${name}` : name;
+
+        // Find matching page
+        const matchingPage = existingPages.find(p => p.path === path);
+
+        if (!matchingPage) {
+          warn(`  No page found for path: ${path} - skipping`);
+          skipped++;
+          continue;
+        }
+
+        if (options.dryRun) {
+          console.log(`  Would update: ${path} (ID: ${matchingPage.id})`);
+        } else {
+          spinner.start(`Updating ${path}...`);
+          await updatePage(matchingPage.id, { content });
+          updated++;
+        }
+      }
+
+      spinner.stop();
+      if (options.dryRun) {
+        warn('Dry run - no pages updated');
+      } else {
+        success(`Updated ${updated} page(s), skipped ${skipped}`);
+      }
+    } catch (err) {
+      spinner.fail('Bulk update failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ RESTORE BACKUP ============
+program
+  .command('restore-backup <file>')
+  .description('Restore pages from a backup file')
+  .option('--dry-run', 'Preview without restoring')
+  .option('--force', 'Overwrite existing pages')
+  .option('--skip-existing', 'Skip pages that already exist')
+  .action(async (file, options) => {
+    const spinner = ora('Reading backup file...').start();
+    try {
+      const backupContent = readFileSync(file, 'utf-8');
+      const backup = JSON.parse(backupContent);
+
+      if (!backup.pages || !Array.isArray(backup.pages)) {
+        throw new Error('Invalid backup file format');
+      }
+
+      spinner.stop();
+      info(`Backup from: ${backup.date}`);
+      info(`Pages to restore: ${backup.pages.length}`);
+
+      // Get existing pages
+      spinner.start('Fetching existing pages...');
+      const existingPages = await listPages({ limit: 10000 });
+      const existingPaths = new Set(existingPages.map(p => p.path));
+      spinner.stop();
+
+      let created = 0;
+      let updated = 0;
+      let skipped = 0;
+
+      for (const page of backup.pages) {
+        const exists = existingPaths.has(page.path);
+
+        if (exists) {
+          if (options.skipExisting) {
+            if (options.dryRun) {
+              console.log(`  Would skip (exists): ${page.path}`);
+            }
+            skipped++;
+            continue;
+          } else if (!options.force) {
+            warn(`  Page exists: ${page.path} - use --force to overwrite or --skip-existing to skip`);
+            skipped++;
+            continue;
+          }
+        }
+
+        if (options.dryRun) {
+          console.log(`  Would ${exists ? 'update' : 'create'}: ${page.path}`);
+          if (exists) updated++;
+          else created++;
+        } else {
+          spinner.start(`${exists ? 'Updating' : 'Creating'} ${page.path}...`);
+
+          if (exists) {
+            const existingPage = existingPages.find(p => p.path === page.path);
+            await updatePage(existingPage.id, {
+              content: page.content,
+              title: page.title,
+              description: page.description,
+              tags: page.tags
+            });
+            updated++;
+          } else {
+            await createPage(page.path, page.title, {
+              content: page.content,
+              description: page.description,
+              tags: page.tags || [],
+              locale: page.locale,
+              isPublished: page.isPublished
+            });
+            created++;
+          }
+        }
+      }
+
+      spinner.stop();
+      if (options.dryRun) {
+        warn('Dry run - no changes made');
+        info(`Would create: ${created}, update: ${updated}, skip: ${skipped}`);
+      } else {
+        success(`Restore complete: ${created} created, ${updated} updated, ${skipped} skipped`);
+      }
+    } catch (err) {
+      spinner.fail('Restore failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ TREE ============
+program
+  .command('tree')
+  .description('Display page hierarchy as a tree')
+  .option('--locale <locale>', 'Filter by locale')
+  .option('--format <format>', 'Output format (tree|json)', 'tree')
+  .action(async (options) => {
+    const spinner = ora('Fetching pages...').start();
+    try {
+      let pages = await listPages({ limit: 10000 });
+
+      if (options.locale) {
+        pages = pages.filter(p => p.locale === options.locale);
+      }
+
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(pages.map(p => ({ id: p.id, path: p.path, title: p.title }))));
+      } else {
+        if (pages.length === 0) {
+          warn('No pages found');
+          return;
+        }
+        console.log(renderTree(pages, {
+          getPath: p => p.path,
+          getLabel: p => p.title,
+          getId: p => p.id
+        }));
+        info(`${pages.length} page(s) total`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to build tree');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ DIFF ============
+program
+  .command('diff <id-or-path>')
+  .description('Compare two versions of a page')
+  .option('--v1 <version>', 'First version ID')
+  .option('--v2 <version>', 'Second version ID (default: current)')
+  .option('--context <lines>', 'Context lines', '3')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Fetching page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      // Get current page content
+      const currentPage = await getPage(pageId);
+
+      // Get versions
+      spinner.text = 'Fetching versions...';
+      const versions = await getPageVersions(pageId);
+
+      if (versions.length < 2 && !options.v1) {
+        spinner.stop();
+        warn('Page has no previous versions to compare');
+        return;
+      }
+
+      spinner.stop();
+
+      // For now, we can only compare current vs info about versions
+      // Wiki.js doesn't expose version content directly via GraphQL
+      // So we show what versions exist
+      if (!options.v1) {
+        info('Available versions:');
+        console.log(formatTable(versions, [
+          { header: 'Version', accessor: v => v.versionId },
+          { header: 'Date', accessor: v => formatDate(v.versionDate) },
+          { header: 'Author', accessor: v => v.authorName },
+          { header: 'Action', accessor: v => v.actionType }
+        ]));
+        warn('Note: Wiki.js API does not expose version content directly.');
+        warn('Use `wikijs revert` to restore a previous version.');
+      } else {
+        // Show current content info
+        info(`Current page: ${currentPage.title}`);
+        info(`Content length: ${(currentPage.content || '').length} characters`);
+        info(`Last updated: ${formatDate(currentPage.updatedAt)}`);
+      }
+    } catch (err) {
+      spinner.fail('Diff failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ CHECK-LINKS ============
+program
+  .command('check-links')
+  .description('Find broken internal links')
+  .option('--path <prefix>', 'Limit to path prefix')
+  .option('--format <format>', 'Output format (table|json)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Fetching pages...').start();
+    try {
+      const pages = await listPages({ limit: 10000 });
+      const existingPaths = new Set(pages.map(p => '/' + p.path));
+      existingPaths.add('/'); // Root
+
+      const brokenLinks = [];
+      const progress = createProgress(pages.length, 'Checking');
+
+      spinner.stop();
+
+      for (const pageInfo of pages) {
+        if (options.path && !pageInfo.path.startsWith(options.path)) {
+          progress.increment();
+          continue;
+        }
+
+        await rateLimit();
+        const page = await getPage(pageInfo.id);
+        const links = extractLinks(page.content || '');
+
+        for (const link of links) {
+          if (!isInternalLink(link.url)) continue;
+
+          // Normalize the link path
+          let targetPath = link.url;
+          if (!targetPath.startsWith('/')) {
+            // Relative link - resolve from current page
+            const currentDir = '/' + dirname(pageInfo.path);
+            targetPath = join(currentDir, targetPath);
+          }
+
+          // Remove anchor and query string
+          targetPath = targetPath.split('#')[0].split('?')[0];
+
+          // Check if target exists
+          if (!existingPaths.has(targetPath) && !existingPaths.has(targetPath.slice(1))) {
+            brokenLinks.push({
+              page: pageInfo.path,
+              pageId: pageInfo.id,
+              linkText: link.text,
+              linkUrl: link.url,
+              resolvedPath: targetPath
+            });
+          }
+        }
+
+        progress.increment();
+      }
+
+      progress.done();
+
+      if (brokenLinks.length === 0) {
+        success('No broken links found!');
+        return;
+      }
+
+      if (options.format === 'json') {
+        console.log(formatJson(brokenLinks));
+      } else {
+        console.log(formatTable(brokenLinks, [
+          { header: 'Page', accessor: l => truncate(l.page, 25) },
+          { header: 'Link Text', accessor: l => truncate(l.linkText, 20) },
+          { header: 'Target', accessor: l => truncate(l.linkUrl, 30) }
+        ]));
+      }
+
+      warn(`Found ${brokenLinks.length} broken link(s)`);
+    } catch (err) {
+      spinner.fail('Link check failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ TEMPLATES ============
+program
+  .command('template <action> [name]')
+  .description('Manage page templates (list|show|create|delete)')
+  .option('--content <content>', 'Template content')
+  .option('--file <file>', 'Read template from file')
+  .action(async (action, name, options) => {
+    try {
+      mkdirSync(TEMPLATES_DIR, { recursive: true });
+
+      switch (action) {
+        case 'list': {
+          if (!existsSync(TEMPLATES_DIR)) {
+            info('No templates found');
+            return;
+          }
+          const templates = readdirSync(TEMPLATES_DIR).filter(f => f.endsWith('.md'));
+          if (templates.length === 0) {
+            info('No templates found');
+            return;
+          }
+          console.log(chalk.bold('Available templates:'));
+          templates.forEach(t => console.log(`  - ${t.replace('.md', '')}`));
+          break;
+        }
+
+        case 'show': {
+          if (!name) {
+            error('Template name required');
+            process.exit(1);
+          }
+          const templatePath = join(TEMPLATES_DIR, `${name}.md`);
+          if (!existsSync(templatePath)) {
+            error(`Template not found: ${name}`);
+            process.exit(1);
+          }
+          console.log(readFileSync(templatePath, 'utf-8'));
+          break;
+        }
+
+        case 'create': {
+          if (!name) {
+            error('Template name required');
+            process.exit(1);
+          }
+          let content = options.content || '';
+          if (options.file) {
+            content = readFileSync(options.file, 'utf-8');
+          }
+          if (!content) {
+            // Default template
+            content = `# {{title}}
+
+## Overview
+
+TODO: Add overview
+
+## Details
+
+TODO: Add details
+`;
+          }
+          const templatePath = join(TEMPLATES_DIR, `${name}.md`);
+          writeFileSync(templatePath, content);
+          success(`Template created: ${name}`);
+          info(`Location: ${templatePath}`);
+          break;
+        }
+
+        case 'delete': {
+          if (!name) {
+            error('Template name required');
+            process.exit(1);
+          }
+          const templatePath = join(TEMPLATES_DIR, `${name}.md`);
+          if (!existsSync(templatePath)) {
+            error(`Template not found: ${name}`);
+            process.exit(1);
+          }
+          const { unlinkSync } = await import('fs');
+          unlinkSync(templatePath);
+          success(`Template deleted: ${name}`);
+          break;
+        }
+
+        default:
+          error(`Unknown action: ${action}. Use: list, show, create, delete`);
+          process.exit(1);
+      }
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ COMPLETION ============
+program
+  .command('completion <shell>')
+  .description('Generate shell completion script (bash|zsh|fish)')
+  .action((shell) => {
+    const commands = [
+      'list', 'search', 'get', 'create', 'update', 'move', 'delete',
+      'tags', 'tag', 'export', 'backup', 'restore-backup',
+      'images', 'upload', 'delete-image', 'grep', 'stats', 'health',
+      'info', 'versions', 'revert', 'bulk-create', 'bulk-update', 'sync',
+      'tree', 'diff', 'check-links', 'template', 'completion', 'cache',
+      'open', 'recent', 'drafts', 'init', 'lint', 'clone', 'orphans',
+      'replace', 'toc', 'duplicates', 'sitemap', 'shell', 'watch',
+      'spellcheck', 'validate', 'ls', 'rm', 'mv', 'cp'
+    ];
+
+    switch (shell) {
+      case 'bash':
+        console.log(`# Wiki.js CLI bash completion
+# Add to ~/.bashrc: eval "$(wikijs completion bash)"
+
+_wikijs_completions() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}"
+  local commands="${commands.join(' ')}"
+
+  if [ $COMP_CWORD -eq 1 ]; then
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+  fi
+}
+
+complete -F _wikijs_completions wikijs`);
+        break;
+
+      case 'zsh':
+        console.log(`# Wiki.js CLI zsh completion
+# Add to ~/.zshrc: eval "$(wikijs completion zsh)"
+
+_wikijs() {
+  local commands=(${commands.map(c => `'${c}'`).join(' ')})
+
+  _arguments -C \\
+    '1:command:->command' \\
+    '*::arg:->args'
+
+  case "$state" in
+    command)
+      _describe 'command' commands
+      ;;
+  esac
+}
+
+compdef _wikijs wikijs`);
+        break;
+
+      case 'fish':
+        console.log(`# Wiki.js CLI fish completion
+# Save to ~/.config/fish/completions/wikijs.fish
+
+${commands.map(c => `complete -c wikijs -n "__fish_use_subcommand" -a "${c}"`).join('\n')}`);
+        break;
+
+      default:
+        error(`Unknown shell: ${shell}. Supported: bash, zsh, fish`);
+        process.exit(1);
+    }
+  });
+
+// ============ CACHE ============
+program
+  .command('cache <action>')
+  .description('Manage local cache (clear|info)')
+  .action(async (action) => {
+    const cacheDir = join(homedir(), '.cache', 'wikijs-cli');
+
+    switch (action) {
+      case 'clear':
+        try {
+          const { rmSync } = await import('fs');
+          rmSync(cacheDir, { recursive: true, force: true });
+          success('Cache cleared');
+        } catch (err) {
+          if (err.code === 'ENOENT') {
+            info('Cache is empty');
+          } else {
+            error(err.message);
+          }
+        }
+        break;
+
+      case 'info':
+        if (!existsSync(cacheDir)) {
+          info('Cache is empty');
+          return;
+        }
+        const files = readdirSync(cacheDir);
+        info(`Cache location: ${cacheDir}`);
+        info(`Cached items: ${files.length}`);
+        break;
+
+      default:
+        error(`Unknown action: ${action}. Use: clear, info`);
+        process.exit(1);
+    }
+  });
+
+// ============ QUICK COMMANDS ============
+
+// Open page in browser
+program
+  .command('open <id-or-path>')
+  .description('Open a page in the browser')
+  .action(async (idOrPath) => {
+    try {
+      const config = loadConfig();
+      const parsed = parseIdOrPath(idOrPath);
+      let pagePath;
+
+      if (parsed.type === 'id') {
+        const spinner = ora('Fetching page...').start();
+        const page = await getPage(parsed.value);
+        spinner.stop();
+        pagePath = page.path;
+      } else {
+        pagePath = idOrPath.startsWith('/') ? idOrPath.slice(1) : idOrPath;
+      }
+
+      const url = `${config.url}/${pagePath}`;
+      info(`Opening: ${url}`);
+
+      // Cross-platform open command
+      const { exec } = await import('child_process');
+      const cmd = process.platform === 'darwin' ? 'open' :
+                  process.platform === 'win32' ? 'start' : 'xdg-open';
+      exec(`${cmd} "${url}"`);
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// Recent pages
+program
+  .command('recent')
+  .description('Show recently modified pages')
+  .option('--limit <n>', 'Number of pages', '10')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Fetching recent pages...').start();
+    try {
+      let pages = await listPages({ limit: 1000 });
+
+      // Sort by updatedAt descending
+      pages.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      pages = pages.slice(0, parseInt(options.limit));
+
+      spinner.stop();
+
+      if (options.format === 'json') {
+        console.log(formatJson(pages));
+      } else {
+        console.log(formatTable(pages, [
+          { header: 'ID', accessor: p => p.id },
+          { header: 'Path', accessor: p => truncate(p.path, 30) },
+          { header: 'Title', accessor: p => truncate(p.title, 35) },
+          { header: 'Updated', accessor: p => formatDate(p.updatedAt) }
+        ]));
+      }
+    } catch (err) {
+      spinner.fail('Failed to fetch recent pages');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// Draft pages
+program
+  .command('drafts')
+  .description('List unpublished draft pages')
+  .option('--format <format>', 'Output format (json|table)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Fetching drafts...').start();
+    try {
+      const pages = await listPages({ limit: 10000 });
+      const drafts = pages.filter(p => !p.isPublished);
+
+      spinner.stop();
+
+      if (drafts.length === 0) {
+        info('No drafts found');
+        return;
+      }
+
+      if (options.format === 'json') {
+        console.log(formatJson(drafts));
+      } else {
+        console.log(formatTable(drafts, [
+          { header: 'ID', accessor: p => p.id },
+          { header: 'Path', accessor: p => truncate(p.path, 30) },
+          { header: 'Title', accessor: p => truncate(p.title, 40) },
+          { header: 'Updated', accessor: p => formatDate(p.updatedAt) }
+        ]));
+        info(`${drafts.length} draft(s) found`);
+      }
+    } catch (err) {
+      spinner.fail('Failed to fetch drafts');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ INIT (Config Wizard) ============
+program
+  .command('init')
+  .description('Interactive configuration setup')
+  .option('--force', 'Overwrite existing config')
+  .action(async (options) => {
+    const configPath = getConfigPath();
+
+    if (existsSync(configPath) && !options.force) {
+      warn(`Config already exists: ${configPath}`);
+      const { overwrite } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'overwrite',
+        message: 'Overwrite existing configuration?',
+        default: false
+      }]);
+      if (!overwrite) {
+        info('Setup cancelled');
+        return;
+      }
+    }
+
+    console.log(chalk.bold('\nWiki.js CLI Setup\n'));
+
+    const answers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'url',
+        message: 'Wiki.js URL:',
+        default: 'http://localhost:3000',
+        validate: (input) => {
+          if (!input.startsWith('http://') && !input.startsWith('https://')) {
+            return 'URL must start with http:// or https://';
+          }
+          return true;
+        }
+      },
+      {
+        type: 'password',
+        name: 'apiToken',
+        message: 'API Token:',
+        mask: '*',
+        validate: (input) => input.length > 0 || 'API token is required'
+      },
+      {
+        type: 'list',
+        name: 'defaultLocale',
+        message: 'Default locale:',
+        choices: ['en', 'fr', 'de', 'es', 'it', 'pt', 'zh', 'ja', 'ko'],
+        default: 'en'
+      },
+      {
+        type: 'confirm',
+        name: 'testConnection',
+        message: 'Test connection now?',
+        default: true
+      }
+    ]);
+
+    const config = {
+      url: answers.url.replace(/\/$/, ''), // Remove trailing slash
+      apiToken: answers.apiToken,
+      defaultEditor: 'markdown',
+      defaultLocale: answers.defaultLocale,
+      autoSync: {
+        enabled: false,
+        path: './sync',
+        intervalHours: 24
+      },
+      backup: {
+        enabled: true,
+        path: './backups',
+        keepDays: 30
+      }
+    };
+
+    // Ensure directory exists
+    const configDir = dirname(configPath);
+    mkdirSync(configDir, { recursive: true });
+
+    // Write config
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    success(`Configuration saved: ${configPath}`);
+
+    // Test connection
+    if (answers.testConnection) {
+      const spinner = ora('Testing connection...').start();
+      try {
+        const healthInfo = await getHealth();
+        spinner.stop();
+        success(`Connected to Wiki.js ${healthInfo.currentVersion}`);
+      } catch (err) {
+        spinner.fail('Connection failed');
+        error(err.message);
+        warn('Please check your URL and API token');
+      }
+    }
+  });
+
+// ============ LINT ============
+program
+  .command('lint [file]')
+  .description('Lint a markdown file or page content')
+  .option('--id <id>', 'Lint page by ID')
+  .option('--path <path>', 'Lint page by path')
+  .option('--fix', 'Attempt to fix issues (file only)')
+  .option('--format <format>', 'Output format (text|json)', 'text')
+  .action(async (file, options) => {
+    try {
+      let content;
+      let source;
+
+      if (file) {
+        // Lint local file
+        if (!existsSync(file)) {
+          error(`File not found: ${file}`);
+          process.exit(1);
+        }
+        content = readFileSync(file, 'utf-8');
+        source = file;
+      } else if (options.id || options.path) {
+        // Lint page from wiki
+        const spinner = ora('Fetching page...').start();
+        const idOrPath = options.id || options.path;
+        const parsed = parseIdOrPath(idOrPath);
+        const page = await getPage(parsed.type === 'id' ? parsed.value : idOrPath);
+        content = page.content || '';
+        source = page.path;
+        spinner.stop();
+      } else {
+        error('Specify a file or use --id/--path to lint a wiki page');
+        process.exit(1);
+      }
+
+      const results = lintMarkdown(content);
+
+      if (options.format === 'json') {
+        console.log(formatJson({
+          source,
+          valid: results.valid,
+          errors: results.errors,
+          warnings: results.warnings
+        }));
+      } else {
+        console.log(chalk.bold(`\nLinting: ${source}`));
+        console.log('───────────────────');
+        console.log(formatLintResults(results));
+
+        if (results.errors.length > 0) {
+          console.log(`\n${chalk.red('✖')} ${results.errors.length} error(s), ${results.warnings.length} warning(s)`);
+        } else if (results.warnings.length > 0) {
+          console.log(`\n${chalk.yellow('⚠')} ${results.warnings.length} warning(s)`);
+        } else {
+          console.log(`\n${chalk.green('✓')} No issues found`);
+        }
+      }
+
+      // Fix issues if requested (file only)
+      if (options.fix && file && (results.errors.length > 0 || results.warnings.length > 0)) {
+        let fixed = content;
+
+        // Fix trailing whitespace
+        fixed = fixed.replace(/[ \t]+$/gm, '');
+
+        // Fix multiple blank lines
+        fixed = fixed.replace(/\n{3,}/g, '\n\n');
+
+        // Fix heading spaces
+        fixed = fixed.replace(/^(#{1,6})([^#\s])/gm, '$1 $2');
+
+        // Fix tabs (convert to 2 spaces)
+        fixed = fixed.replace(/\t/g, '  ');
+
+        if (fixed !== content) {
+          writeFileSync(file, fixed);
+          success(`Fixed issues in ${file}`);
+        }
+      }
+
+      // Exit with error code if errors found
+      if (results.errors.length > 0) {
+        process.exit(1);
+      }
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ CLONE ============
+program
+  .command('clone <id-or-path> <new-path>')
+  .description('Duplicate a page to a new location')
+  .option('--title <title>', 'New title (default: "Copy of <original>")')
+  .option('--with-tags', 'Copy tags to new page')
+  .action(async (idOrPath, newPath, options) => {
+    const spinner = ora('Cloning page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      const sourcePage = await getPage(parsed.type === 'id' ? parsed.value : idOrPath);
+
+      const newTitle = options.title || `Copy of ${sourcePage.title}`;
+      const tags = options.withTags ? (sourcePage.tags || []) : [];
+
+      spinner.text = 'Creating clone...';
+      const newPage = await createPage(newPath, newTitle, {
+        content: sourcePage.content,
+        description: sourcePage.description,
+        tags,
+        locale: sourcePage.locale,
+        isPublished: sourcePage.isPublished
+      });
+
+      spinner.stop();
+      success(`Page cloned: ${newPage.path} (ID: ${newPage.id})`);
+    } catch (err) {
+      spinner.fail('Clone failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ ORPHANS ============
+program
+  .command('orphans')
+  .description('Find pages with no incoming links')
+  .option('--format <format>', 'Output format (table|json)', 'table')
+  .action(async (options) => {
+    const spinner = ora('Analyzing links...').start();
+    try {
+      const pages = await listPages({ limit: 10000 });
+      const allPaths = new Set(pages.map(p => '/' + p.path));
+
+      // Track which pages are linked to
+      const linkedPages = new Set();
+      const progress = createProgress(pages.length, 'Scanning');
+
+      spinner.stop();
+
+      for (const pageInfo of pages) {
+        await rateLimit();
+        const page = await getPage(pageInfo.id);
+        const links = extractLinks(page.content || '');
+
+        for (const link of links) {
+          if (!isInternalLink(link.url)) continue;
+
+          let targetPath = link.url;
+          if (!targetPath.startsWith('/')) {
+            const currentDir = '/' + dirname(pageInfo.path);
+            targetPath = join(currentDir, targetPath);
+          }
+          targetPath = targetPath.split('#')[0].split('?')[0];
+
+          linkedPages.add(targetPath);
+          linkedPages.add(targetPath.slice(1)); // Without leading slash
+        }
+
+        progress.increment();
+      }
+
+      progress.done();
+
+      // Find orphans (pages not linked from anywhere)
+      const orphans = pages.filter(p => {
+        const withSlash = '/' + p.path;
+        return !linkedPages.has(withSlash) && !linkedPages.has(p.path);
+      });
+
+      if (orphans.length === 0) {
+        success('No orphan pages found!');
+        return;
+      }
+
+      if (options.format === 'json') {
+        console.log(formatJson(orphans));
+      } else {
+        console.log(formatTable(orphans, [
+          { header: 'ID', accessor: p => p.id },
+          { header: 'Path', accessor: p => truncate(p.path, 35) },
+          { header: 'Title', accessor: p => truncate(p.title, 35) },
+          { header: 'Updated', accessor: p => formatDate(p.updatedAt) }
+        ]));
+      }
+
+      warn(`Found ${orphans.length} orphan page(s) with no incoming links`);
+    } catch (err) {
+      spinner.fail('Analysis failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ REPLACE ============
+program
+  .command('replace <search> <replacement>')
+  .description('Search and replace text across pages')
+  .option('--path <prefix>', 'Limit to path prefix')
+  .option('--regex', 'Treat search as regex')
+  .option('--case-sensitive', 'Case sensitive search')
+  .option('--dry-run', 'Preview changes without applying')
+  .option('--limit <n>', 'Limit pages to process', '1000')
+  .action(async (search, replacement, options) => {
+    const spinner = ora('Scanning pages...').start();
+    try {
+      const pages = await listPages({ limit: parseInt(options.limit) });
+      const flags = options.caseSensitive ? 'g' : 'gi';
+      const regex = options.regex ? new RegExp(search, flags) : new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+
+      spinner.stop();
+
+      const matches = [];
+
+      for (const pageInfo of pages) {
+        if (options.path && !pageInfo.path.startsWith(options.path)) continue;
+
+        await rateLimit();
+        const page = await getPage(pageInfo.id);
+        const content = page.content || '';
+
+        if (regex.test(content)) {
+          const matchCount = (content.match(regex) || []).length;
+          matches.push({
+            id: page.id,
+            path: page.path,
+            title: page.title,
+            matchCount,
+            content
+          });
+        }
+      }
+
+      if (matches.length === 0) {
+        info('No matches found');
+        return;
+      }
+
+      console.log(chalk.bold(`\nFound ${matches.length} page(s) with matches:\n`));
+      matches.forEach(m => {
+        console.log(`  ${chalk.blue(m.path)} - ${m.matchCount} match(es)`);
+      });
+
+      if (options.dryRun) {
+        warn('\nDry run - no changes made');
+        return;
+      }
+
+      // Confirm before replacing
+      const { confirm } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirm',
+        message: `Replace in ${matches.length} page(s)?`,
+        default: false
+      }]);
+
+      if (!confirm) {
+        info('Replacement cancelled');
+        return;
+      }
+
+      const progress = createProgress(matches.length, 'Replacing');
+
+      let updated = 0;
+      for (const match of matches) {
+        const newContent = match.content.replace(regex, replacement);
+        await rateLimit();
+        await updatePage(match.id, { content: newContent });
+        updated++;
+        progress.increment();
+      }
+
+      progress.done();
+      success(`Updated ${updated} page(s)`);
+    } catch (err) {
+      spinner.fail('Replace failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ TOC ============
+program
+  .command('toc <id-or-path>')
+  .description('Generate table of contents for a page')
+  .option('--format <format>', 'Output format (markdown|json|html)', 'markdown')
+  .option('--max-depth <n>', 'Maximum heading depth', '6')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Fetching page...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      const page = await getPage(parsed.type === 'id' ? parsed.value : idOrPath);
+      const content = page.content || '';
+
+      spinner.stop();
+
+      // Extract headings
+      const headingRegex = /^(#{1,6})\s+(.+)$/gm;
+      const headings = [];
+      let match;
+
+      while ((match = headingRegex.exec(content)) !== null) {
+        const level = match[1].length;
+        if (level <= parseInt(options.maxDepth)) {
+          const text = match[2].trim();
+          const slug = text.toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-');
+          headings.push({ level, text, slug });
+        }
+      }
+
+      if (headings.length === 0) {
+        warn('No headings found in page');
+        return;
+      }
+
+      console.log(chalk.bold(`\nTable of Contents: ${page.title}\n`));
+
+      switch (options.format) {
+        case 'json':
+          console.log(formatJson(headings));
+          break;
+
+        case 'html':
+          console.log('<ul>');
+          headings.forEach(h => {
+            const indent = '  '.repeat(h.level);
+            console.log(`${indent}<li><a href="#${h.slug}">${h.text}</a></li>`);
+          });
+          console.log('</ul>');
+          break;
+
+        default: // markdown
+          headings.forEach(h => {
+            const indent = '  '.repeat(h.level - 1);
+            console.log(`${indent}- [${h.text}](#${h.slug})`);
+          });
+      }
+
+      info(`\n${headings.length} heading(s) found`);
+    } catch (err) {
+      spinner.fail('TOC generation failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ DUPLICATES ============
+program
+  .command('duplicates')
+  .description('Find pages with similar or duplicate content')
+  .option('--threshold <n>', 'Similarity threshold (0-100)', '70')
+  .option('--format <format>', 'Output format (table|json)', 'table')
+  .option('--limit <n>', 'Limit pages to analyze', '500')
+  .action(async (options) => {
+    const spinner = ora('Analyzing content...').start();
+    try {
+      const pages = await listPages({ limit: parseInt(options.limit) });
+      const threshold = parseInt(options.threshold) / 100;
+
+      spinner.stop();
+
+      // Simple similarity based on common words
+      function getWords(text) {
+        return text.toLowerCase()
+          .replace(/[^\w\s]/g, '')
+          .split(/\s+/)
+          .filter(w => w.length > 3);
+      }
+
+      function similarity(words1, words2) {
+        const set1 = new Set(words1);
+        const set2 = new Set(words2);
+        const intersection = [...set1].filter(w => set2.has(w));
+        const union = new Set([...set1, ...set2]);
+        return intersection.length / union.size;
+      }
+
+      const pageContents = [];
+      const progress = createProgress(pages.length, 'Fetching');
+
+      for (const pageInfo of pages) {
+        await rateLimit();
+        const page = await getPage(pageInfo.id);
+        pageContents.push({
+          id: page.id,
+          path: page.path,
+          title: page.title,
+          words: getWords(page.content || '')
+        });
+        progress.increment();
+      }
+
+      progress.done();
+
+      // Find duplicates
+      const duplicates = [];
+      const checked = new Set();
+
+      for (let i = 0; i < pageContents.length; i++) {
+        for (let j = i + 1; j < pageContents.length; j++) {
+          const key = `${pageContents[i].id}-${pageContents[j].id}`;
+          if (checked.has(key)) continue;
+          checked.add(key);
+
+          const sim = similarity(pageContents[i].words, pageContents[j].words);
+          if (sim >= threshold) {
+            duplicates.push({
+              page1: pageContents[i].path,
+              page1Id: pageContents[i].id,
+              page2: pageContents[j].path,
+              page2Id: pageContents[j].id,
+              similarity: Math.round(sim * 100)
+            });
+          }
+        }
+      }
+
+      if (duplicates.length === 0) {
+        success('No similar pages found');
+        return;
+      }
+
+      // Sort by similarity descending
+      duplicates.sort((a, b) => b.similarity - a.similarity);
+
+      if (options.format === 'json') {
+        console.log(formatJson(duplicates));
+      } else {
+        console.log(formatTable(duplicates, [
+          { header: 'Page 1', accessor: d => truncate(d.page1, 30) },
+          { header: 'Page 2', accessor: d => truncate(d.page2, 30) },
+          { header: 'Similarity', accessor: d => `${d.similarity}%` }
+        ]));
+      }
+
+      warn(`Found ${duplicates.length} pair(s) of similar pages`);
+    } catch (err) {
+      spinner.fail('Analysis failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ SITEMAP ============
+program
+  .command('sitemap')
+  .description('Generate XML sitemap')
+  .option('--output <file>', 'Output file (default: stdout)')
+  .option('--base-url <url>', 'Base URL for sitemap')
+  .option('--priority <n>', 'Default priority (0.0-1.0)', '0.5')
+  .option('--changefreq <freq>', 'Change frequency', 'weekly')
+  .action(async (options) => {
+    const spinner = ora('Generating sitemap...').start();
+    try {
+      const config = loadConfig();
+      const baseUrl = options.baseUrl || config.url;
+      const pages = await listPages({ limit: 10000 });
+
+      spinner.stop();
+
+      const xml = [];
+      xml.push('<?xml version="1.0" encoding="UTF-8"?>');
+      xml.push('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">');
+
+      for (const page of pages) {
+        if (!page.isPublished) continue;
+
+        const url = `${baseUrl}/${page.path}`;
+        const lastmod = page.updatedAt ? new Date(page.updatedAt).toISOString().split('T')[0] : '';
+
+        xml.push('  <url>');
+        xml.push(`    <loc>${url}</loc>`);
+        if (lastmod) xml.push(`    <lastmod>${lastmod}</lastmod>`);
+        xml.push(`    <changefreq>${options.changefreq}</changefreq>`);
+        xml.push(`    <priority>${options.priority}</priority>`);
+        xml.push('  </url>');
+      }
+
+      xml.push('</urlset>');
+
+      const output = xml.join('\n');
+
+      if (options.output) {
+        writeFileSync(options.output, output);
+        success(`Sitemap written to ${options.output}`);
+      } else {
+        console.log(output);
+      }
+
+      info(`${pages.filter(p => p.isPublished !== false).length} URL(s) in sitemap`);
+    } catch (err) {
+      spinner.fail('Sitemap generation failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ SHELL (Interactive Mode) ============
+program
+  .command('shell')
+  .description('Interactive shell mode')
+  .action(async () => {
+    console.log(chalk.bold('\nWiki.js Interactive Shell'));
+    console.log('Type "help" for commands, "exit" to quit\n');
+
+    const readline = await import('readline');
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      prompt: chalk.cyan('wikijs> ')
+    });
+
+    const shellCommands = {
+      help: () => {
+        console.log(`
+Available commands:
+  list [limit]      - List pages
+  get <id>          - Get page content
+  search <query>    - Search pages
+  info <id>         - Show page info
+  tree              - Show page tree
+  tags              - List all tags
+  recent [n]        - Recent pages
+  stats             - Show statistics
+  health            - Check connection
+  clear             - Clear screen
+  exit              - Exit shell
+        `);
+      },
+      clear: () => {
+        console.clear();
+      },
+      exit: () => {
+        console.log('Goodbye!');
+        rl.close();
+        process.exit(0);
+      }
+    };
+
+    rl.prompt();
+
+    rl.on('line', async (line) => {
+      const args = line.trim().split(/\s+/);
+      const cmd = args[0];
+
+      if (!cmd) {
+        rl.prompt();
+        return;
+      }
+
+      if (shellCommands[cmd]) {
+        shellCommands[cmd]();
+        rl.prompt();
+        return;
+      }
+
+      // Execute as wikijs command
+      try {
+        const { execSync } = await import('child_process');
+        const result = execSync(`${process.argv[1]} ${line}`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+        console.log(result);
+      } catch (err) {
+        if (err.stdout) console.log(err.stdout);
+        if (err.stderr) console.error(err.stderr);
+      }
+
+      rl.prompt();
+    });
+
+    rl.on('close', () => {
+      process.exit(0);
+    });
+  });
+
+// ============ WATCH ============
+program
+  .command('watch <id-or-path>')
+  .description('Watch a page for changes')
+  .option('--interval <seconds>', 'Check interval in seconds', '30')
+  .option('--notify', 'Show desktop notification on change')
+  .action(async (idOrPath, options) => {
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      let pageId;
+
+      const spinner = ora('Fetching page...').start();
+      if (parsed.type === 'id') {
+        pageId = parsed.value;
+      } else {
+        const page = await getPage(idOrPath);
+        pageId = page.id;
+      }
+
+      let lastPage = await getPage(pageId);
+      spinner.stop();
+
+      info(`Watching: ${lastPage.path} (${lastPage.title})`);
+      info(`Checking every ${options.interval} seconds. Press Ctrl+C to stop.\n`);
+
+      let lastHash = JSON.stringify({
+        content: lastPage.content,
+        title: lastPage.title,
+        updatedAt: lastPage.updatedAt
+      });
+
+      setInterval(async () => {
+        try {
+          const currentPage = await getPage(pageId);
+          const currentHash = JSON.stringify({
+            content: currentPage.content,
+            title: currentPage.title,
+            updatedAt: currentPage.updatedAt
+          });
+
+          if (currentHash !== lastHash) {
+            const timestamp = new Date().toLocaleTimeString();
+            console.log(chalk.yellow(`[${timestamp}] Page changed!`));
+            console.log(`  Title: ${currentPage.title}`);
+            console.log(`  Updated: ${formatDate(currentPage.updatedAt)}`);
+
+            // Show diff summary
+            const oldLines = (lastPage.content || '').split('\n').length;
+            const newLines = (currentPage.content || '').split('\n').length;
+            const diff = newLines - oldLines;
+            if (diff > 0) {
+              console.log(chalk.green(`  +${diff} lines`));
+            } else if (diff < 0) {
+              console.log(chalk.red(`  ${diff} lines`));
+            }
+            console.log('');
+
+            lastHash = currentHash;
+            lastPage = currentPage;
+          }
+        } catch (err) {
+          console.error(chalk.red(`[Error] ${err.message}`));
+        }
+      }, parseInt(options.interval) * 1000);
+
+    } catch (err) {
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ SPELLCHECK ============
+program
+  .command('spellcheck <id-or-path>')
+  .description('Check spelling in a page')
+  .option('--lang <lang>', 'Language (en|fr|de|es)', 'en')
+  .option('--ignore <words>', 'Words to ignore (comma-separated)')
+  .option('--format <format>', 'Output format (text|json)', 'text')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Checking spelling...').start();
+    try {
+      const parsed = parseIdOrPath(idOrPath);
+      const page = await getPage(parsed.type === 'id' ? parsed.value : idOrPath);
+      const content = page.content || '';
+
+      spinner.stop();
+
+      // Common words dictionary (basic implementation)
+      const commonWords = {
+        en: new Set(['the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they', 'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one', 'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get', 'which', 'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know', 'take', 'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other', 'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'us', 'is', 'are', 'was', 'were', 'been', 'being', 'has', 'had', 'does', 'did', 'done', 'should', 'must', 'need', 'here', 'where', 'why', 'how', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such', 'very', 'just', 'own', 'same', 'too', 'much', 'many', 'before', 'between', 'under', 'again', 'once', 'during', 'always', 'never', 'today', 'part', 'long', 'great', 'little', 'still', 'found', 'made', 'said', 'called', 'may', 'might', 'shall']),
+        fr: new Set(['le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'et', 'est', 'en', 'que', 'qui', 'dans', 'ce', 'il', 'elle', 'pas', 'ne', 'plus', 'son', 'pour', 'se', 'par', 'sur', 'avec', 'tout', 'faire', 'avoir', 'être', 'nous', 'vous', 'ils', 'elles', 'leur', 'cette', 'ces', 'mais', 'ou', 'donc', 'car', 'ni', 'si', 'comme', 'quand', 'très', 'bien', 'aussi', 'même', 'peut', 'fait', 'dit', 'autre', 'tous', 'sans', 'entre', 'après', 'avant', 'encore', 'ici', 'où', 'comment', 'pourquoi', 'cela', 'dont', 'moins', 'sous', 'chez', 'peu', 'trop', 'toujours', 'jamais', 'fois', 'jour', 'homme', 'femme', 'temps', 'vie', 'monde', 'chose', 'voir', 'aller', 'venir', 'prendre', 'savoir', 'pouvoir', 'vouloir', 'falloir', 'deux', 'trois', 'premier', 'nouveau', 'grand', 'petit', 'bon', 'jeune', 'vieux', 'seul', 'dernier', 'long', 'haut', 'beau', 'gros', 'je', 'tu', 'me', 'te', 'mon', 'ton', 'notre', 'votre', 'mes', 'tes', 'nos', 'vos', 'ses', 'aux'])
+      };
+
+      const ignoreWords = new Set((options.ignore || '').split(',').map(w => w.trim().toLowerCase()));
+      const dictionary = commonWords[options.lang] || commonWords.en;
+
+      // Extract words from content (skip code blocks, links, etc.)
+      const textOnly = content
+        .replace(/```[\s\S]*?```/g, '') // Remove code blocks
+        .replace(/`[^`]+`/g, '') // Remove inline code
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // Keep link text
+        .replace(/https?:\/\/\S+/g, '') // Remove URLs
+        .replace(/[#*_~`>|]/g, ' '); // Remove markdown chars
+
+      const words = textOnly.match(/[a-zA-ZÀ-ÿ]{3,}/g) || [];
+      const unknownWords = [];
+      const seen = new Set();
+
+      for (const word of words) {
+        const lower = word.toLowerCase();
+        if (seen.has(lower)) continue;
+        seen.add(lower);
+
+        if (!dictionary.has(lower) && !ignoreWords.has(lower)) {
+          unknownWords.push(word);
+        }
+      }
+
+      console.log(chalk.bold(`\nSpellcheck: ${page.title}`));
+      console.log('───────────────────');
+
+      if (unknownWords.length === 0) {
+        success('No potential spelling issues found');
+      } else {
+        if (options.format === 'json') {
+          console.log(formatJson({ page: page.path, unknownWords }));
+        } else {
+          warn(`${unknownWords.length} potential issue(s):`);
+          console.log('\n' + unknownWords.join(', '));
+          info('\nNote: These may be technical terms, proper nouns, or valid words not in the basic dictionary.');
+          info('Use --ignore to skip specific words.');
+        }
+      }
+    } catch (err) {
+      spinner.fail('Spellcheck failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ VALIDATE ============
+program
+  .command('validate [id-or-path]')
+  .description('Validate page content (images, links, frontmatter)')
+  .option('--all', 'Validate all pages')
+  .option('--fix', 'Attempt to fix issues')
+  .option('--format <format>', 'Output format (text|json)', 'text')
+  .action(async (idOrPath, options) => {
+    const spinner = ora('Validating...').start();
+    try {
+      let pagesToValidate = [];
+
+      if (options.all) {
+        pagesToValidate = await listPages({ limit: 10000 });
+      } else if (idOrPath) {
+        const parsed = parseIdOrPath(idOrPath);
+        const page = await getPage(parsed.type === 'id' ? parsed.value : idOrPath);
+        pagesToValidate = [page];
+      } else {
+        spinner.fail('Specify a page ID/path or use --all');
+        process.exit(1);
+      }
+
+      spinner.stop();
+
+      const allIssues = [];
+      const progress = options.all ? createProgress(pagesToValidate.length, 'Validating') : null;
+
+      for (const pageInfo of pagesToValidate) {
+        const page = options.all ? await getPage(pageInfo.id) : pageInfo;
+        const issues = [];
+        const content = page.content || '';
+
+        // Check for broken image references
+        const imgRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+        let match;
+        while ((match = imgRegex.exec(content)) !== null) {
+          const imgUrl = match[2];
+          if (isInternalLink(imgUrl)) {
+            issues.push({
+              type: 'warning',
+              rule: 'image-reference',
+              message: `Image reference may need verification: ${imgUrl}`
+            });
+          }
+        }
+
+        // Check for empty headings
+        if (content.match(/^#{1,6}\s*$/m)) {
+          issues.push({
+            type: 'error',
+            rule: 'empty-heading',
+            message: 'Empty heading found'
+          });
+        }
+
+        // Check for consecutive headings (no content between)
+        if (content.match(/^#{1,6}\s+.+\n#{1,6}\s+/m)) {
+          issues.push({
+            type: 'warning',
+            rule: 'consecutive-headings',
+            message: 'Consecutive headings without content between'
+          });
+        }
+
+        // Check for TODO/FIXME comments
+        const todoMatches = content.match(/\b(TODO|FIXME|XXX|HACK)\b/gi);
+        if (todoMatches) {
+          issues.push({
+            type: 'info',
+            rule: 'todo-comments',
+            message: `Found ${todoMatches.length} TODO/FIXME comment(s)`
+          });
+        }
+
+        // Check for very short pages
+        if (content.length < 50 && content.length > 0) {
+          issues.push({
+            type: 'warning',
+            rule: 'short-content',
+            message: 'Page content is very short (< 50 chars)'
+          });
+        }
+
+        // Check for missing title in content
+        if (!content.match(/^#\s+/m) && content.length > 100) {
+          issues.push({
+            type: 'info',
+            rule: 'no-title-heading',
+            message: 'No H1 heading found in content'
+          });
+        }
+
+        // Check markdown lint issues
+        const lintResults = lintMarkdown(content);
+        issues.push(...lintResults.errors.map(e => ({ ...e, type: 'error' })));
+        issues.push(...lintResults.warnings.map(w => ({ ...w, type: 'warning' })));
+
+        if (issues.length > 0) {
+          allIssues.push({
+            page: page.path,
+            pageId: page.id,
+            title: page.title,
+            issues
+          });
+        }
+
+        if (progress) progress.increment();
+      }
+
+      if (progress) progress.done();
+
+      if (allIssues.length === 0) {
+        success('All pages validated successfully!');
+        return;
+      }
+
+      if (options.format === 'json') {
+        console.log(formatJson(allIssues));
+      } else {
+        console.log(chalk.bold('\nValidation Results\n'));
+
+        for (const pageIssues of allIssues) {
+          console.log(chalk.blue(`${pageIssues.page} (ID: ${pageIssues.pageId})`));
+
+          const errors = pageIssues.issues.filter(i => i.type === 'error');
+          const warnings = pageIssues.issues.filter(i => i.type === 'warning');
+          const infos = pageIssues.issues.filter(i => i.type === 'info');
+
+          errors.forEach(i => console.log(chalk.red(`  ✗ ${i.message}`)));
+          warnings.forEach(i => console.log(chalk.yellow(`  ⚠ ${i.message}`)));
+          infos.forEach(i => console.log(chalk.gray(`  ℹ ${i.message}`)));
+          console.log('');
+        }
+
+        const totalErrors = allIssues.reduce((sum, p) => sum + p.issues.filter(i => i.type === 'error').length, 0);
+        const totalWarnings = allIssues.reduce((sum, p) => sum + p.issues.filter(i => i.type === 'warning').length, 0);
+
+        console.log(`${allIssues.length} page(s) with issues: ${totalErrors} error(s), ${totalWarnings} warning(s)`);
+      }
+    } catch (err) {
+      spinner.fail('Validation failed');
+      error(err.message);
+      process.exit(1);
+    }
+  });
+
+// ============ ALIASES ============
+// Create aliases for common commands
+program.command('ls').description('Alias for list').action(() => {
+  process.argv.splice(2, 1, 'list');
+  program.parse();
+});
+
+program.command('rm <id-or-path>').description('Alias for delete').action(() => {
+  process.argv.splice(2, 1, 'delete');
+  program.parse();
+});
+
+program.command('mv <id-or-path> <new-path>').description('Alias for move').action(() => {
+  process.argv.splice(2, 1, 'move');
+  program.parse();
+});
+
+program.command('cp <id-or-path>').description('Alias for get (copy content)').action(() => {
+  process.argv.splice(2, 1, 'get');
+  program.parse();
+});
+
+program.parse();

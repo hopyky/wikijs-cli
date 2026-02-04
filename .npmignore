@@ -1,0 +1,38 @@
+# Development files
+.github/
+tests/
+__tests__/
+*.test.js
+*.spec.js
+jest.config.js
+.eslintrc*
+.prettierrc*
+
+# Build/coverage
+coverage/
+.nyc_output/
+
+# Config examples (keep wikijs.example.json)
+*.local.json
+
+# Documentation (README included by default)
+docs/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.md
+!README.md
